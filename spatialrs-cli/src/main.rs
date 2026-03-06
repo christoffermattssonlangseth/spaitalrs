@@ -323,67 +323,56 @@ fn main() -> Result<()> {
                 .as_ref()
                 .context("expression matrix not loaded")?;
 
-            // Build groups: either partition by obs column or treat all as one group
-            let groups: Vec<(String, Vec<usize>)> = if let Some(ref col) = groupby {
-                partition_by_group(&adata, col)?
-            } else {
-                vec![("all".to_string(), (0..adata.obs_names.len()).collect())]
-            };
-
-            // Run NMF per group (parallel), with a per-group iteration progress bar
+            // Run NMF once on ALL cells pooled — factors are then comparable across samples.
+            // Group label is attached to output records from obs afterwards.
+            let n_cells = adata.obs_names.len();
             let multi = MultiProgress::new();
-            let results: Vec<(String, Vec<usize>, spatialrs_core::nmf::NmfResult)> = groups
-                .into_par_iter()
-                .map(|(label, indices)| {
-                    let prefix = format!("NMF {label} ({} cells)", indices.len());
-                    let pb = iter_bar(&multi, max_iter, &prefix);
-                    let pb2 = pb.clone();
-                    let config = NmfConfig {
-                        n_components,
-                        max_iter,
-                        tol,
-                        seed,
-                        epsilon: 1e-12,
-                        iter_cb: Some(Arc::new(move |iter: usize, err: f32| {
-                            pb2.set_position(iter as u64);
-                            pb2.set_message(format!("err={err:.2}"));
-                        })),
-                    };
-                    let x_sub = x_full.select(ndarray::Axis(0), &indices);
-                    let result = run_nmf(&x_sub, &config)?;
-                    pb.finish_with_message(format!("err={:.2}", result.final_error));
-                    Ok((label, indices, result))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let pb = iter_bar(&multi, max_iter, &format!("NMF ({n_cells} cells)"));
+            let pb2 = pb.clone();
+            let config = NmfConfig {
+                n_components,
+                max_iter,
+                tol,
+                seed,
+                epsilon: 1e-12,
+                iter_cb: Some(Arc::new(move |iter: usize, err: f32| {
+                    pb2.set_position(iter as u64);
+                    pb2.set_message(format!("err={err:.2}"));
+                })),
+            };
+            let result = run_nmf(x_full, &config)?;
+            pb.finish_with_message(format!("err={:.2}", result.final_error));
 
-            // Build W records
+            let group_col_opt = groupby.as_deref().and_then(|col| adata.obs.get(col));
+
             let mut w_records: Vec<WRecord> = Vec::new();
             let mut h_records: Vec<HRecord> = Vec::new();
 
-            for (label, indices, result) in &results {
-                for (local_row, &global_i) in indices.iter().enumerate() {
-                    let barcode = &adata.obs_names[global_i];
-                    for comp in 0..n_components {
-                        w_records.push(WRecord {
-                            cell_i: barcode.clone(),
-                            component: comp,
-                            weight: result.w[[local_row, comp]],
-                            group: label.clone(),
-                        });
-                    }
+            for (i, barcode) in adata.obs_names.iter().enumerate() {
+                let group = group_col_opt
+                    .and_then(|col| col.get(i))
+                    .map(|s| s.as_str())
+                    .unwrap_or("all")
+                    .to_string();
+                for comp in 0..n_components {
+                    w_records.push(WRecord {
+                        cell_i: barcode.clone(),
+                        component: comp,
+                        weight: result.w[[i, comp]],
+                        group: group.clone(),
+                    });
                 }
+            }
 
-                for (gene_idx, gene) in adata.var_names.iter().enumerate() {
-                    for comp in 0..n_components {
-                        h_records.push(HRecord {
-                            gene: gene.clone(),
-                            component: comp,
-                            loading: result.h[[comp, gene_idx]],
-                            group: label.clone(),
-                        });
-                    }
+            for (gene_idx, gene) in adata.var_names.iter().enumerate() {
+                for comp in 0..n_components {
+                    h_records.push(HRecord {
+                        gene: gene.clone(),
+                        component: comp,
+                        loading: result.h[[comp, gene_idx]],
+                        group: "all".to_string(),
+                    });
                 }
-
             }
 
             write_csv(&w_records, output_w.as_deref())?;
@@ -436,55 +425,49 @@ fn main() -> Result<()> {
                 CovarianceArg::Spherical => CovarianceType::Spherical,
             };
 
-            let groups = partition_by_group(&adata, &groupby)?;
-
-            // Run GMM per group in parallel, with a per-group iteration progress bar
+            // Run GMM once on ALL cells pooled — this gives globally consistent niche IDs
+            // across samples. The group label is attached to output records afterwards.
+            let n_cells = emb_full.nrows();
             let multi = MultiProgress::new();
-            let group_results: Vec<(String, Vec<usize>, spatialrs_core::gmm::GmmResult)> = groups
-                .into_par_iter()
-                .map(|(label, indices)| {
-                    let prefix = format!("GMM {label} ({} cells)", indices.len());
-                    let pb = iter_bar(&multi, max_iter, &prefix);
-                    let pb2 = pb.clone();
-                    let config = GmmConfig {
-                        n_components: k,
-                        max_iter,
-                        tol,
-                        seed,
-                        covariance: cov_type,
-                        reg_covar,
-                        iter_cb: Some(Arc::new(move |iter: usize, ll: f64| {
-                            pb2.set_position(iter as u64);
-                            pb2.set_message(format!("ll={ll:.1}"));
-                        })),
-                    };
-                    let emb_sub = emb_full.select(ndarray::Axis(0), &indices);
-                    let result  = run_gmm(&emb_sub, &config)?;
-                    pb.finish_with_message(format!("ll={:.1}", result.log_likelihood));
-                    Ok((label, indices, result))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let pb = iter_bar(&multi, max_iter, &format!("GMM ({n_cells} cells)"));
+            let pb2 = pb.clone();
+            let config = GmmConfig {
+                n_components: k,
+                max_iter,
+                tol,
+                seed,
+                covariance: cov_type,
+                reg_covar,
+                iter_cb: Some(Arc::new(move |iter: usize, ll: f64| {
+                    pb2.set_position(iter as u64);
+                    pb2.set_message(format!("ll={ll:.1}"));
+                })),
+            };
+            let result = run_gmm(emb_full, &config)?;
+            pb.finish_with_message(format!("ll={:.1}", result.log_likelihood));
+
+            let group_col = adata.obs.get(&groupby)
+                .ok_or_else(|| anyhow::anyhow!("groupby column '{groupby}' not found in obs"))?;
 
             let mut niche_records: Vec<NicheRecord>     = Vec::new();
             let mut prob_records:  Vec<NicheProbRecord> = Vec::new();
 
-            for (label, indices, result) in &group_results {
-                for (local_i, &global_i) in indices.iter().enumerate() {
-                    let barcode = &adata.obs_names[global_i];
-                    niche_records.push(NicheRecord {
-                        cell_i: barcode.clone(),
-                        niche:  result.labels[local_i],
-                        group:  label.clone(),
-                    });
-                    if output_probs.is_some() {
-                        for comp in 0..k {
-                            prob_records.push(NicheProbRecord {
-                                cell_i:      barcode.clone(),
-                                component:   comp,
-                                probability: result.responsibilities[[local_i, comp]],
-                                group:       label.clone(),
-                            });
-                        }
+            for (i, barcode) in adata.obs_names.iter().enumerate() {
+                let group = group_col.get(i).map(|s| s.as_str()).unwrap_or("").to_string();
+                niche_records.push(NicheRecord {
+                    cell_i: barcode.clone(),
+                    niche:  result.labels[i],
+                    group,
+                });
+                if output_probs.is_some() {
+                    let group2 = group_col.get(i).map(|s| s.as_str()).unwrap_or("").to_string();
+                    for comp in 0..k {
+                        prob_records.push(NicheProbRecord {
+                            cell_i:      barcode.clone(),
+                            component:   comp,
+                            probability: result.responsibilities[[i, comp]],
+                            group:       group2.clone(),
+                        });
                     }
                 }
             }

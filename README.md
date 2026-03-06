@@ -82,19 +82,10 @@ For each cell, computes the fraction of each cell type among its neighbours with
 
 Factorizes the gene expression matrix X (cells × genes) into W (cell factors) and H (gene loadings) using multiplicative update rules (Lee & Seung 2001).
 
-```bash
-# All cells as one group
-spatialrs nmf data.h5ad \
-    --n-components 20 \
-    --output-w w_factors.csv \
-    --output-h h_loadings.csv
+**All cells are factorized together** so that component indices are directly comparable across samples. `--groupby` is used only to label output records, not to split the factorization.
 
-# Per-sample factorization
-spatialrs nmf data.h5ad \
-    --n-components 20 \
-    --groupby sample \
-    --output-w w_factors.csv \
-    --output-h h_loadings.csv
+```bash
+spatialrs nmf data.h5ad --n-components 20 --groupby sample --output-w w_factors.csv --output-h h_loadings.csv
 ```
 
 | Flag | Default | Description |
@@ -103,11 +94,9 @@ spatialrs nmf data.h5ad \
 | `--max-iter` | 200 | Maximum multiplicative update iterations |
 | `--tol` | 1e-4 | Convergence tolerance on Frobenius error change |
 | `--seed` | 42 | RNG seed for reproducible initialisation |
-| `--groupby` | *(none)* | Optional obs column to partition cells before factorizing |
+| `--groupby` | *(none)* | Optional obs column used to label output records |
 | `--output-w` | stdout | W matrix CSV (long format: `cell_i, component, weight, group`) |
 | `--output-h` | *(skip)* | H matrix CSV (long format: `gene, component, loading, group`) |
-
-Convergence status is printed to stderr per group.
 
 ---
 
@@ -149,21 +138,23 @@ Cells with no neighbours within the search radius emit zeros.
 ### `gmm` — Gaussian Mixture Model niche detection
 
 Fits a GMM to an embedding to identify spatial compartments / niches.
-The typical pipeline is:
+
+**All cells are clustered together** so that niche IDs are consistent across samples. `--groupby` labels output records only.
+
+#### Recommended pipeline: NMF → aggregate → GMM
 
 ```bash
-# 1. Build distance-weighted aggregated embedding per cell
-spatialrs aggregate data.h5ad \
-    --embedding X_scVI --radius 30 --weighting gaussian --sigma 15 \
-    --groupby sample --output agg.csv
+# 1. Factorize gene expression across all cells (pooled)
+spatialrs nmf data.h5ad --n-components 20 --groupby sample --output-w /tmp/w.csv --output-h /tmp/h.csv
 
-# 2. Cluster the aggregated embeddings into niches
-spatialrs gmm data.h5ad --agg agg.csv \
-    -k 10 --covariance diagonal --groupby sample \
-    --output niches.csv --output-probs probs.csv
+# 2. Aggregate spatial neighbourhoods using NMF factors (per sample — spatial coords don't mix)
+spatialrs aggregate data.h5ad --nmf-w /tmp/w.csv --radius 75 --weighting gaussian --sigma 37 --groupby sample --output /tmp/agg.csv
+
+# 3. Cluster aggregated embeddings into niches (pooled)
+spatialrs gmm data.h5ad --agg /tmp/agg.csv -k 10 --groupby sample --output /tmp/niches.csv --output-probs /tmp/niches_probs.csv
 ```
 
-You can also feed the GMM raw obsm embeddings or NMF factors directly:
+You can also feed a raw obsm embedding or skip straight to GMM on the NMF factors:
 
 ```bash
 spatialrs gmm data.h5ad --embedding X_scVI -k 10 --groupby sample --output niches.csv
@@ -188,13 +179,11 @@ spatialrs gmm data.h5ad --nmf-w w_factors.csv -k 10 --groupby sample --output ni
 | `--tol` | 1e-6 | Convergence tolerance on log-likelihood change |
 | `--seed` | 42 | RNG seed for K-means++ initialisation |
 | `--reg-covar` | 1e-6 | Regularisation added to variance to prevent singularity |
-| `--groupby` | `sample` | Obs column; GMM is fit independently per group |
+| `--groupby` | `sample` | Obs column used to label output records |
 
 **Outputs:**
 - `--output` — hard assignments: `cell_i, niche, group`
 - `--output-probs` *(optional)* — soft responsibilities: `cell_i, component, probability, group`
-
-Convergence status (log-likelihood, iterations) is printed to stderr per group.
 
 ---
 
@@ -211,7 +200,9 @@ Standard `.h5ad` files written by AnnData (Python).
 
 ## Design notes
 
-- Groups (samples) are processed in parallel with Rayon; spatial indexing uses an R* tree (`rstar`).
+- **NMF and GMM run on all cells pooled** so that factor/niche indices are comparable across samples. `--groupby` only labels output records.
+- **`aggregate` runs per sample** because spatial coordinates are sample-local and neighbours should not cross sample boundaries.
+- Groups are processed in parallel with Rayon; spatial indexing uses an R* tree (`rstar`).
 - NMF element-wise updates use `ndarray::Zip::par_for_each` across rayon threads.
 - All CSV outputs are long format to be compatible with any number of components or embedding dimensions.
 - Cells without neighbours in `aggregate` are kept in the output (zeros) to preserve a 1-to-1 join with the input.
