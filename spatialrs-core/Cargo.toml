@@ -9,3 +9,5 @@ thiserror = { workspace = true }
 serde     = { workspace = true }
 rayon     = { workspace = true }
 rstar     = { workspace = true }
+ndarray   = { workspace = true }
+rand      = { workspace = true }

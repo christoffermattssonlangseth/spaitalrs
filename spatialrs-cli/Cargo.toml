@@ -13,5 +13,6 @@ serde         = { workspace = true }
 rayon         = { workspace = true }
 csv           = { workspace = true }
 clap          = { workspace = true }
+ndarray       = { workspace = true }
 spatialrs-core = { path = "../spatialrs-core" }
 spatialrs-io   = { path = "../spatialrs-io" }
