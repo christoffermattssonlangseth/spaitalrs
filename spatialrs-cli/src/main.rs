@@ -1,8 +1,10 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressStyle};
 use ndarray::Array2;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use spatialrs_core::{
     aggregation::{aggregate_neighbors, AggregationRecord, GraphMode, WeightingMode},
     composition::compute_composition,
@@ -204,8 +206,10 @@ fn main() -> Result<()> {
             let adata = read_h5ad(&input, &[&groupby], &[], false)?;
             let groups = partition_by_group(&adata, &groupby)?;
 
+            let pb = group_bar(groups.len(), "radius");
             let records: Vec<EdgeRecord> = groups
                 .par_iter()
+                .progress_with(pb)
                 .map(|(label, indices)| {
                     let coords = extract_coords_subset(&adata, indices);
                     let barcodes = extract_barcodes_subset(&adata, indices);
@@ -228,8 +232,10 @@ fn main() -> Result<()> {
             let adata = read_h5ad(&input, &[&groupby], &[], false)?;
             let groups = partition_by_group(&adata, &groupby)?;
 
+            let pb = group_bar(groups.len(), "knn");
             let records: Vec<EdgeRecord> = groups
                 .par_iter()
+                .progress_with(pb)
                 .map(|(label, indices)| {
                     let coords = extract_coords_subset(&adata, indices);
                     let barcodes = extract_barcodes_subset(&adata, indices);
@@ -253,8 +259,10 @@ fn main() -> Result<()> {
             let adata = read_h5ad(&input, &[&groupby, &cell_type], &[], false)?;
             let groups = partition_by_group(&adata, &groupby)?;
 
+            let pb = group_bar(groups.len(), "interactions");
             let records: Vec<_> = groups
                 .par_iter()
+                .progress_with(pb)
                 .map(|(label, indices)| {
                     let coords = extract_coords_subset(&adata, indices);
                     let barcodes = extract_barcodes_subset(&adata, indices);
@@ -279,8 +287,10 @@ fn main() -> Result<()> {
             let adata = read_h5ad(&input, &[&groupby, &cell_type], &[], false)?;
             let groups = partition_by_group(&adata, &groupby)?;
 
+            let pb = group_bar(groups.len(), "composition");
             let records: Vec<_> = groups
                 .par_iter()
+                .progress_with(pb)
                 .map(|(label, indices)| {
                     let coords = extract_coords_subset(&adata, indices);
                     let barcodes = extract_barcodes_subset(&adata, indices);
@@ -313,14 +323,6 @@ fn main() -> Result<()> {
                 .as_ref()
                 .context("expression matrix not loaded")?;
 
-            let config = NmfConfig {
-                n_components,
-                max_iter,
-                tol,
-                seed,
-                epsilon: 1e-12,
-            };
-
             // Build groups: either partition by obs column or treat all as one group
             let groups: Vec<(String, Vec<usize>)> = if let Some(ref col) = groupby {
                 partition_by_group(&adata, col)?
@@ -328,12 +330,28 @@ fn main() -> Result<()> {
                 vec![("all".to_string(), (0..adata.obs_names.len()).collect())]
             };
 
-            // Run NMF per group (parallel)
+            // Run NMF per group (parallel), with a per-group iteration progress bar
+            let multi = MultiProgress::new();
             let results: Vec<(String, Vec<usize>, spatialrs_core::nmf::NmfResult)> = groups
                 .into_par_iter()
                 .map(|(label, indices)| {
+                    let prefix = format!("NMF {label} ({} cells)", indices.len());
+                    let pb = iter_bar(&multi, max_iter, &prefix);
+                    let pb2 = pb.clone();
+                    let config = NmfConfig {
+                        n_components,
+                        max_iter,
+                        tol,
+                        seed,
+                        epsilon: 1e-12,
+                        iter_cb: Some(Arc::new(move |iter: usize, err: f32| {
+                            pb2.set_position(iter as u64);
+                            pb2.set_message(format!("err={err:.2}"));
+                        })),
+                    };
                     let x_sub = x_full.select(ndarray::Axis(0), &indices);
                     let result = run_nmf(&x_sub, &config)?;
+                    pb.finish_with_message(format!("err={:.2}", result.final_error));
                     Ok((label, indices, result))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -366,13 +384,6 @@ fn main() -> Result<()> {
                     }
                 }
 
-                eprintln!(
-                    "[nmf] group='{}' cells={} iter={} error={:.4}",
-                    label,
-                    indices.len(),
-                    result.n_iter,
-                    result.final_error,
-                );
             }
 
             write_csv(&w_records, output_w.as_deref())?;
@@ -424,16 +435,32 @@ fn main() -> Result<()> {
                 CovarianceArg::Diagonal  => CovarianceType::Diagonal,
                 CovarianceArg::Spherical => CovarianceType::Spherical,
             };
-            let config = GmmConfig { n_components: k, max_iter, tol, seed, covariance: cov_type, reg_covar };
 
             let groups = partition_by_group(&adata, &groupby)?;
 
-            // Run GMM per group in parallel
+            // Run GMM per group in parallel, with a per-group iteration progress bar
+            let multi = MultiProgress::new();
             let group_results: Vec<(String, Vec<usize>, spatialrs_core::gmm::GmmResult)> = groups
                 .into_par_iter()
                 .map(|(label, indices)| {
+                    let prefix = format!("GMM {label} ({} cells)", indices.len());
+                    let pb = iter_bar(&multi, max_iter, &prefix);
+                    let pb2 = pb.clone();
+                    let config = GmmConfig {
+                        n_components: k,
+                        max_iter,
+                        tol,
+                        seed,
+                        covariance: cov_type,
+                        reg_covar,
+                        iter_cb: Some(Arc::new(move |iter: usize, ll: f64| {
+                            pb2.set_position(iter as u64);
+                            pb2.set_message(format!("ll={ll:.1}"));
+                        })),
+                    };
                     let emb_sub = emb_full.select(ndarray::Axis(0), &indices);
                     let result  = run_gmm(&emb_sub, &config)?;
+                    pb.finish_with_message(format!("ll={:.1}", result.log_likelihood));
                     Ok((label, indices, result))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -460,10 +487,6 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                eprintln!(
-                    "[gmm] group='{}' cells={} iter={} log_likelihood={:.4}",
-                    label, indices.len(), result.n_iter, result.log_likelihood,
-                );
             }
 
             write_csv(&niche_records, output.as_deref())?;
@@ -589,8 +612,10 @@ fn aggregate_group_embedding(
     graph: &GraphMode,
     weight_mode: &WeightingMode,
 ) -> Result<Vec<AggregationRecord>> {
+    let pb = group_bar(groups.len(), "aggregate");
     groups
         .par_iter()
+        .progress_with(pb)
         .map(|(label, indices)| {
             let coords = extract_coords_subset(adata, indices);
             let barcodes = extract_barcodes_subset(adata, indices);
@@ -735,6 +760,35 @@ fn read_agg_embedding(
     }
 
     Ok(embedding)
+}
+
+/// Progress bar shown over a small number of groups (e.g. 2 samples).
+fn group_bar(n_groups: usize, label: &str) -> ProgressBar {
+    let pb = ProgressBar::new(n_groups as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "  {prefix:.bold.cyan} [{bar:40.cyan/blue}] {pos}/{len} groups  {elapsed_precise}",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    pb.set_prefix(label.to_string());
+    pb
+}
+
+/// Per-iteration progress bar for NMF / GMM (one per group, managed by MultiProgress).
+fn iter_bar(multi: &MultiProgress, n_iter: usize, prefix: &str) -> ProgressBar {
+    let pb = multi.add(ProgressBar::new(n_iter as u64));
+    pb.set_style(
+        ProgressStyle::with_template(
+            "  {prefix:.bold.cyan} [{bar:40.cyan/blue}] {pos}/{len} iter  {msg}  {elapsed_precise}",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    pb.set_prefix(prefix.to_string());
+    pb.set_message("starting");
+    pb
 }
 
 fn write_csv<T: Serialize>(records: &[T], output: Option<&std::path::Path>) -> Result<()> {

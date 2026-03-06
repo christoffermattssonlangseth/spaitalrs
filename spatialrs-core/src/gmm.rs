@@ -8,6 +8,7 @@ use std::f64::consts::PI;
 
 // ─── public types ─────────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy)]
 pub enum CovarianceType {
     /// One variance per (component, dimension)
     Diagonal,
@@ -22,6 +23,8 @@ pub struct GmmConfig {
     pub seed:         u64,
     pub covariance:   CovarianceType,
     pub reg_covar:    f64,    // regularisation added to variance floor
+    /// Called each EM iteration with (iteration, log_likelihood).
+    pub iter_cb: Option<std::sync::Arc<dyn Fn(usize, f64) + Send + Sync>>,
 }
 
 impl Default for GmmConfig {
@@ -33,6 +36,7 @@ impl Default for GmmConfig {
             seed:         42,
             covariance:   CovarianceType::Diagonal,
             reg_covar:    1e-6,
+            iter_cb:      None,
         }
     }
 }
@@ -97,6 +101,10 @@ pub fn run_gmm(x: &Array2<f64>, config: &GmmConfig) -> Result<GmmResult> {
 
         m_step(x, &resp, &mut means, &mut variances, &mut weights,
                config.reg_covar, &config.covariance);
+
+        if let Some(ref cb) = config.iter_cb {
+            cb(iter + 1, new_ll);
+        }
 
         if (new_ll - log_likelihood).abs() < config.tol {
             n_iter = iter + 1;

@@ -6,20 +6,23 @@ use serde::Serialize;
 
 pub struct NmfConfig {
     pub n_components: usize,
-    pub max_iter: usize,
-    pub tol: f32,
-    pub seed: u64,
-    pub epsilon: f32,
+    pub max_iter:     usize,
+    pub tol:          f32,
+    pub seed:         u64,
+    pub epsilon:      f32,
+    /// Called every 10 iterations with (iteration, frobenius_error).
+    pub iter_cb: Option<std::sync::Arc<dyn Fn(usize, f32) + Send + Sync>>,
 }
 
 impl Default for NmfConfig {
     fn default() -> Self {
         NmfConfig {
             n_components: 10,
-            max_iter: 200,
-            tol: 1e-4,
-            seed: 42,
-            epsilon: 1e-12,
+            max_iter:     200,
+            tol:          1e-4,
+            seed:         42,
+            epsilon:      1e-12,
+            iter_cb:      None,
         }
     }
 }
@@ -96,6 +99,9 @@ pub fn run_nmf(x: &Array2<f32>, config: &NmfConfig) -> Result<NmfResult> {
         if (iter + 1) % 10 == 0 {
             let err = frobenius_error(x, &w, &h);
             final_error = err;
+            if let Some(ref cb) = config.iter_cb {
+                cb(iter + 1, err);
+            }
             if (prev_err - err).abs() < config.tol {
                 n_iter = iter + 1;
                 break;
