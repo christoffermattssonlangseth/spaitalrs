@@ -1,0 +1,5 @@
+[env]
+HDF5_DIR = "/Users/christoffer/miniconda3/envs/ks-gui"
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-args=-Wl,-rpath,/Users/christoffer/miniconda3/envs/ks-gui/lib"]

@@ -95,6 +95,36 @@ pub fn radius_graph(
     Ok(records)
 }
 
+/// Upper-triangle index pairs only, no barcodes.  Used by `interactions` permutation test.
+pub(crate) fn radius_graph_index_pairs(
+    coords: &[[f64; 2]],
+    radius: f64,
+) -> Result<Vec<(usize, usize)>> {
+    validate_positive_radius(radius)?;
+
+    let points: Vec<IndexedPoint> = coords
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| IndexedPoint { coords: c, index: i })
+        .collect();
+
+    let tree = RTree::bulk_load(points);
+    let r2 = radius * radius;
+
+    let pairs: Vec<(usize, usize)> = coords
+        .par_iter()
+        .enumerate()
+        .flat_map(|(i, c)| {
+            tree.locate_within_distance(*c, r2)
+                .filter(|p| p.index > i)
+                .map(|p| (i, p.index))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    Ok(pairs)
+}
+
 /// Upper-triangle-only radius graph (one edge per pair, no duplicates).
 /// Used internally by `interactions`.
 pub(crate) fn radius_graph_dedup(

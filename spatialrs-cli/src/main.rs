@@ -7,9 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use spatialrs_core::{
     aggregation::{aggregate_neighbors, AggregationRecord, GraphMode, WeightingMode},
+    autocorr::{compute_morans_i, MoranRecord},
     composition::compute_composition,
     gmm::{run_gmm, CovarianceType, GmmConfig, NicheProbRecord, NicheRecord},
-    interactions::count_interactions,
+    interactions::{count_interactions, permute_interactions, InteractionStatsRecord},
+    markers::{find_niche_markers, MarkerRecord},
     neighbors::{knn_graph, radius_graph, EdgeRecord},
     nmf::{run_nmf, HRecord, NmfConfig, WRecord},
 };
@@ -56,6 +58,25 @@ struct AggInputRecord {
     group:  String,
 }
 
+#[derive(Deserialize)]
+struct NicheInputRecord {
+    cell_i: String,
+    niche:  usize,
+    #[allow(dead_code)]
+    group:  String,
+}
+
+#[derive(Serialize)]
+struct ModelStatsRecord {
+    k:               usize,
+    log_likelihood:  f64,
+    bic:             f64,
+    aic:             f64,
+    n_iter:          usize,
+    covariance_type: String,
+    group:           String,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Compute radius-based neighbour graph
@@ -87,8 +108,17 @@ enum Command {
         radius: f64,
         #[arg(long, default_value = "sample")]
         groupby: String,
+        /// Output CSV for raw interaction counts (group, cell_type_a, cell_type_b, count)
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Number of permutations for null model (requires --output-stats)
+        #[arg(long, default_value_t = 1000)]
+        n_permutations: usize,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Output CSV for enrichment statistics (observed, expected_mean, z_score, p_value)
+        #[arg(long)]
+        output_stats: Option<PathBuf>,
     },
     /// Compute per-cell neighbourhood composition
     Composition {
@@ -157,6 +187,35 @@ enum Command {
         /// Output CSV for soft probabilities (cell_i, component, probability, group)
         #[arg(long)]
         output_probs: Option<PathBuf>,
+        /// Output CSV for model fit statistics (k, log_likelihood, bic, aic, n_iter, covariance_type)
+        #[arg(long)]
+        output_model_stats: Option<PathBuf>,
+    },
+    /// Compute global Moran's I spatial autocorrelation for NMF components or embedding dims
+    Morans {
+        input: PathBuf,
+        /// obsm key for the embedding (mutually exclusive with --nmf-w)
+        #[arg(long, conflicts_with = "nmf_w")]
+        embedding: Option<String>,
+        /// NMF W factors CSV from `spatialrs nmf` (mutually exclusive with --embedding)
+        #[arg(long, conflicts_with = "embedding")]
+        nmf_w: Option<PathBuf>,
+        /// Radius for spatial neighbour search
+        #[arg(long)]
+        radius: f64,
+        #[arg(long, default_value = "sample")]
+        groupby: String,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Identify niche marker genes using one-vs-rest Wilcoxon rank-sum tests
+    Markers {
+        input: PathBuf,
+        /// Niche assignments CSV produced by `spatialrs gmm`
+        #[arg(long)]
+        niche_csv: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// Aggregate neighbour embeddings using distance-weighted averaging
     Aggregate {
@@ -255,6 +314,9 @@ fn main() -> Result<()> {
             radius,
             groupby,
             output,
+            n_permutations,
+            seed,
+            output_stats,
         } => {
             let adata = read_h5ad(&input, &[&groupby, &cell_type], &[], false)?;
             let groups = partition_by_group(&adata, &groupby)?;
@@ -275,6 +337,27 @@ fn main() -> Result<()> {
                 .collect();
 
             write_csv(&records, output.as_deref())?;
+
+            if let Some(ref stats_path) = output_stats {
+                let pb2 = group_bar(groups.len(), "permutations");
+                let stats: Vec<InteractionStatsRecord> = groups
+                    .par_iter()
+                    .progress_with(pb2)
+                    .map(|(label, indices)| {
+                        let coords = extract_coords_subset(&adata, indices);
+                        let barcodes = extract_barcodes_subset(&adata, indices);
+                        let types = extract_strings_subset(&adata, &cell_type, indices);
+                        permute_interactions(
+                            &coords, &barcodes, &types, radius,
+                            n_permutations, seed, label,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                write_csv(&stats, Some(stats_path.as_path()))?;
+            }
         }
 
         Command::Composition {
@@ -396,6 +479,7 @@ fn main() -> Result<()> {
             groupby,
             output,
             output_probs,
+            output_model_stats,
         } => {
             let obsm_keys: Vec<&str> = embedding.as_deref().into_iter().collect();
             let adata = read_h5ad(&input, &[&groupby], &obsm_keys, false)?;
@@ -476,6 +560,122 @@ fn main() -> Result<()> {
             if output_probs.is_some() {
                 write_csv(&prob_records, output_probs.as_deref())?;
             }
+            if let Some(ref stats_path) = output_model_stats {
+                let cov_str = match covariance {
+                    CovarianceArg::Diagonal  => "diagonal",
+                    CovarianceArg::Spherical => "spherical",
+                };
+                let stats = vec![ModelStatsRecord {
+                    k,
+                    log_likelihood: result.log_likelihood,
+                    bic:            result.bic,
+                    aic:            result.aic,
+                    n_iter:         result.n_iter,
+                    covariance_type: cov_str.to_string(),
+                    group:          "all".to_string(),
+                }];
+                write_csv(&stats, Some(stats_path.as_path()))?;
+            }
+        }
+
+        Command::Morans {
+            input,
+            embedding,
+            nmf_w,
+            radius,
+            groupby,
+            output,
+        } => {
+            let obsm_keys: Vec<&str> = embedding.as_deref().into_iter().collect();
+            let adata = read_h5ad(&input, &[&groupby], &obsm_keys, false)?;
+
+            let emb_owned: Array2<f64>;
+            let emb_full: &Array2<f64> = match (&embedding, &nmf_w) {
+                (Some(key), None) => adata
+                    .embeddings
+                    .get(key)
+                    .ok_or_else(|| anyhow::anyhow!("embedding '{key}' not loaded"))?,
+                (None, Some(path)) => {
+                    emb_owned = read_nmf_w_embedding(path, &adata, &groupby)?;
+                    &emb_owned
+                }
+                (None, None) => bail!("one of --embedding or --nmf-w is required"),
+                _ => unreachable!("clap conflicts_with prevents this"),
+            };
+
+            let feature_names: Vec<String> = match (&embedding, &nmf_w) {
+                (Some(_), _) => (0..emb_full.ncols()).map(|i| format!("dim_{i}")).collect(),
+                _            => (0..emb_full.ncols()).map(|i| format!("component_{i}")).collect(),
+            };
+
+            let groups = partition_by_group(&adata, &groupby)?;
+
+            let pb = group_bar(groups.len(), "morans");
+            let records: Vec<MoranRecord> = groups
+                .par_iter()
+                .progress_with(pb)
+                .map(|(label, indices)| {
+                    let coords  = extract_coords_subset(&adata, indices);
+                    let emb_sub = emb_full.select(ndarray::Axis(0), indices);
+                    compute_morans_i(&coords, &emb_sub, &feature_names, radius, label)
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+
+            write_csv(&records, output.as_deref())?;
+        }
+
+        Command::Markers {
+            input,
+            niche_csv,
+            output,
+        } => {
+            let adata = read_h5ad(&input, &[], &[], true)?;
+
+            // Read niche assignments CSV
+            let mut rdr = csv::Reader::from_path(&niche_csv)
+                .with_context(|| format!("cannot open {:?}", niche_csv))?;
+            let mut niche_map: HashMap<String, usize> = HashMap::new();
+            let mut max_niche = 0usize;
+            for record in rdr.deserialize() {
+                let row: NicheInputRecord =
+                    record.with_context(|| format!("reading {:?}", niche_csv))?;
+                max_niche = max_niche.max(row.niche);
+                niche_map.insert(row.cell_i, row.niche);
+            }
+            let n_niches = max_niche + 1;
+
+            // Build per-cell niche label vector in obs order
+            let niche_labels: Vec<usize> = adata
+                .obs_names
+                .iter()
+                .map(|b| {
+                    niche_map
+                        .get(b)
+                        .copied()
+                        .with_context(|| format!("barcode '{b}' not found in niche CSV"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let expression = adata
+                .expression
+                .context("expression matrix not loaded")?;
+
+            let n_cells = expression.nrows();
+            let n_genes = expression.ncols();
+            let pb = group_bar(n_niches, "markers");
+            let _ = (n_cells, n_genes, pb); // progress shown inside find_niche_markers via Rayon
+
+            let records: Vec<MarkerRecord> = find_niche_markers(
+                &expression,
+                &adata.var_names,
+                &niche_labels,
+                n_niches,
+            )?;
+
+            write_csv(&records, output.as_deref())?;
         }
 
         Command::Aggregate {

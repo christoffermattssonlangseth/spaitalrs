@@ -50,6 +50,8 @@ pub struct GmmResult {
     pub labels:           Vec<usize>,
     pub n_iter:           usize,
     pub log_likelihood:   f64,
+    pub bic:              f64,
+    pub aic:              f64,
 }
 
 #[derive(Serialize)]
@@ -116,7 +118,14 @@ pub fn run_gmm(x: &Array2<f64>, config: &GmmConfig) -> Result<GmmResult> {
 
     let labels = argmax_rows(&resp);
 
-    Ok(GmmResult { responsibilities: resp, means, labels, n_iter, log_likelihood })
+    let n_params = match config.covariance {
+        CovarianceType::Diagonal  => k * (2 * d + 1) - 1,
+        CovarianceType::Spherical => k * (d + 2) - 1,
+    };
+    let bic = n_params as f64 * (n as f64).ln() - 2.0 * log_likelihood;
+    let aic = 2.0 * n_params as f64 - 2.0 * log_likelihood;
+
+    Ok(GmmResult { responsibilities: resp, means, labels, n_iter, log_likelihood, bic, aic })
 }
 
 // ─── EM steps ─────────────────────────────────────────────────────────────────
