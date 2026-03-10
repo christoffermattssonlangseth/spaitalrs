@@ -1,8 +1,8 @@
 use crate::neighbors::{radius_graph_dedup, radius_graph_index_pairs};
 use anyhow::{bail, Result};
-use rand::seq::SliceRandom;
-use rand::{SeedableRng};
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -17,14 +17,14 @@ pub struct InteractionRecord {
 
 #[derive(Serialize)]
 pub struct InteractionStatsRecord {
-    pub group:         String,
-    pub cell_type_a:   String,
-    pub cell_type_b:   String,
-    pub observed:      usize,
+    pub group: String,
+    pub cell_type_a: String,
+    pub cell_type_b: String,
+    pub observed: usize,
     pub expected_mean: f64,
-    pub expected_std:  f64,
-    pub z_score:       f64,
-    pub p_value:       f64,
+    pub expected_std: f64,
+    pub z_score: f64,
+    pub p_value: f64,
 }
 
 /// Count cell-type pair interactions within `radius`.
@@ -93,13 +93,13 @@ pub fn count_interactions(
 /// to generate a null distribution.  Returns per-pair statistics including
 /// z-score and empirical p-value.
 pub fn permute_interactions(
-    coords:     &[[f64; 2]],
-    barcodes:   &[String],
+    coords: &[[f64; 2]],
+    barcodes: &[String],
     cell_types: &[String],
-    radius:     f64,
-    n_perms:    usize,
-    seed:       u64,
-    group:      &str,
+    radius: f64,
+    n_perms: usize,
+    seed: u64,
+    group: &str,
 ) -> Result<Vec<InteractionStatsRecord>> {
     if coords.len() != barcodes.len() {
         bail!(
@@ -154,7 +154,11 @@ pub fn permute_interactions(
                 .collect();
             let mean = null.iter().sum::<f64>() / n_perms_f;
             let std = (null.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n_perms_f).sqrt();
-            let z_score = if std > 1e-14 { (obs as f64 - mean) / std } else { 0.0 };
+            let z_score = if std > 1e-14 {
+                (obs as f64 - mean) / std
+            } else {
+                0.0
+            };
             // Conservative empirical p-value (+1 in both numerator and denominator)
             let n_exceeding = null.iter().filter(|&&x| x >= obs as f64).count();
             let p_value = (n_exceeding as f64 + 1.0) / (n_perms_f + 1.0);

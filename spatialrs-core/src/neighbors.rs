@@ -4,6 +4,13 @@ use rstar::{PointDistance, RTree, RTreeObject, AABB};
 use serde::Serialize;
 
 #[derive(Serialize)]
+pub struct GraphStatsRecord {
+    pub cell_i: String,
+    pub n_neighbors: usize,
+    pub group: String,
+}
+
+#[derive(Serialize)]
 pub struct EdgeRecord {
     pub cell_i: String,
     pub cell_j: String,
@@ -33,6 +40,48 @@ impl PointDistance for IndexedPoint {
         let dy = self.coords[1] - point[1];
         dx * dx + dy * dy
     }
+}
+
+// ─── graph statistics ─────────────────────────────────────────────────────────
+
+/// Compute per-cell neighbour count (degree) for a radius graph.
+///
+/// Returns one record per cell with `n_neighbors` = number of cells within
+/// `radius` (self excluded).  Useful as a QC metric for choosing `--radius`.
+pub fn compute_graph_stats(
+    coords: &[[f64; 2]],
+    barcodes: &[String],
+    radius: f64,
+    group: &str,
+) -> Result<Vec<GraphStatsRecord>> {
+    validate_input_lengths(coords.len(), barcodes.len())?;
+    validate_positive_radius(radius)?;
+
+    let points: Vec<IndexedPoint> = coords
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| IndexedPoint { coords: c, index: i })
+        .collect();
+    let tree = RTree::bulk_load(points);
+    let r2 = radius * radius;
+
+    let records: Vec<GraphStatsRecord> = coords
+        .par_iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let n_neighbors = tree
+                .locate_within_distance(*c, r2)
+                .filter(|p| p.index != i)
+                .count();
+            GraphStatsRecord {
+                cell_i: barcodes[i].clone(),
+                n_neighbors,
+                group: group.to_string(),
+            }
+        })
+        .collect();
+
+    Ok(records)
 }
 
 // ─── radius graph ─────────────────────────────────────────────────────────────
@@ -105,7 +154,10 @@ pub(crate) fn radius_graph_index_pairs(
     let points: Vec<IndexedPoint> = coords
         .iter()
         .enumerate()
-        .map(|(i, &c)| IndexedPoint { coords: c, index: i })
+        .map(|(i, &c)| IndexedPoint {
+            coords: c,
+            index: i,
+        })
         .collect();
 
     let tree = RTree::bulk_load(points);
@@ -229,7 +281,28 @@ fn validate_positive_radius(radius: f64) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::radius_graph;
+    use super::{compute_graph_stats, radius_graph};
+
+    #[test]
+    fn graph_stats_counts_neighbours_correctly() {
+        // 4 cells in a line; radius 1.5 → endpoints have 1 neighbour, middle cells have 2
+        let coords = [[0.0f64, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0]];
+        let barcodes: Vec<String> = (0..4).map(|i| format!("c{i}")).collect();
+        let records = compute_graph_stats(&coords, &barcodes, 1.5, "g").unwrap();
+        assert_eq!(records.len(), 4);
+        let get = |id: &str| records.iter().find(|r| r.cell_i == id).unwrap().n_neighbors;
+        assert_eq!(get("c0"), 1);
+        assert_eq!(get("c1"), 2);
+        assert_eq!(get("c2"), 2);
+        assert_eq!(get("c3"), 1);
+    }
+
+    #[test]
+    fn graph_stats_rejects_non_positive_radius() {
+        let coords = [[0.0f64, 0.0], [1.0, 0.0]];
+        let barcodes = vec!["a".to_string(), "b".to_string()];
+        assert!(compute_graph_stats(&coords, &barcodes, 0.0, "g").is_err());
+    }
 
     #[test]
     fn radius_graph_rejects_non_positive_radius() {

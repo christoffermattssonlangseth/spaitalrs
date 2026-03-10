@@ -33,6 +33,12 @@ pub struct NmfResult {
     pub h: Array2<f32>,
     pub n_iter: usize,
     pub final_error: f32,
+    /// Frobenius-norm contribution of each component as a fraction of
+    /// the total ||W H||_F.  Computed post-convergence.
+    /// component_variances[k] = ||W[:,k]||₂ × ||H[k,:]||₂ / Σₖ(||W[:,k]||₂ × ||H[k,:]||₂)
+    pub component_variances: Vec<f32>,
+    /// Error trajectory: (iteration, error) collected every 10 iterations.
+    pub error_trajectory: Vec<(usize, f32)>,
 }
 
 #[derive(Serialize)]
@@ -72,6 +78,7 @@ pub fn run_nmf(x: &Array2<f32>, config: &NmfConfig) -> Result<NmfResult> {
     let mut prev_err = f32::INFINITY;
     let mut n_iter = config.max_iter;
     let mut final_error = 0.0f32;
+    let mut error_trajectory: Vec<(usize, f32)> = Vec::new();
 
     for iter in 0..config.max_iter {
         // H update: H ← H * (Wᵀ X) / (Wᵀ W H + ε)
@@ -100,6 +107,7 @@ pub fn run_nmf(x: &Array2<f32>, config: &NmfConfig) -> Result<NmfResult> {
         if (iter + 1) % 10 == 0 {
             let err = frobenius_error(x, &w, &h);
             final_error = err;
+            error_trajectory.push((iter + 1, err));
             if let Some(ref cb) = config.iter_cb {
                 cb(iter + 1, err);
             }
@@ -115,11 +123,15 @@ pub fn run_nmf(x: &Array2<f32>, config: &NmfConfig) -> Result<NmfResult> {
         final_error = frobenius_error(x, &w, &h);
     }
 
+    let component_variances = compute_component_variances(&w, &h);
+
     Ok(NmfResult {
         w,
         h,
         n_iter,
         final_error,
+        component_variances,
+        error_trajectory,
     })
 }
 
@@ -177,6 +189,7 @@ pub fn run_nmf_sparse(
     let mut prev_h = h.clone();
     let mut n_iter = config.max_iter;
     let mut final_error = f32::INFINITY;
+    let mut error_trajectory: Vec<(usize, f32)> = Vec::new();
 
     for iter in 0..config.max_iter {
         // H update: H ← H * (W^T X) / (W^T W H + ε)
@@ -210,6 +223,7 @@ pub fn run_nmf_sparse(
             let prev_norm_sq: f32 = prev_h.iter().map(|&v| v * v).sum();
             let err = (diff_sq / (prev_norm_sq + eps)).sqrt();
             final_error = err;
+            error_trajectory.push((iter + 1, err));
             if let Some(ref cb) = config.iter_cb {
                 cb(iter + 1, err);
             }
@@ -221,12 +235,35 @@ pub fn run_nmf_sparse(
         }
     }
 
+    let component_variances = compute_component_variances(&w, &h);
+
     Ok(NmfResult {
         w,
         h,
         n_iter,
         final_error,
+        component_variances,
+        error_trajectory,
     })
+}
+
+/// Per-component explained-variance fractions.
+///
+/// For each component k:  score_k = ||W[:,k]||₂ × ||H[k,:]||₂
+/// (the Frobenius norm of the rank-1 matrix W[:,k] H[k,:]^T equals
+/// ||W[:,k]||₂ × ||H[k,:]||₂).
+/// Returns the vector of scores normalised to sum to 1.
+fn compute_component_variances(w: &Array2<f32>, h: &Array2<f32>) -> Vec<f32> {
+    let k = w.ncols();
+    let scores: Vec<f32> = (0..k)
+        .map(|c| {
+            let w_norm: f32 = w.column(c).iter().map(|&v| v * v).sum::<f32>().sqrt();
+            let h_norm: f32 = h.row(c).iter().map(|&v| v * v).sum::<f32>().sqrt();
+            w_norm * h_norm
+        })
+        .collect();
+    let total: f32 = scores.iter().sum::<f32>().max(f32::EPSILON);
+    scores.into_iter().map(|s| s / total).collect()
 }
 
 /// Compute W^T × X sparsely.  Returns a k × n_var matrix.

@@ -1,8 +1,12 @@
 pub mod aggregation;
 pub mod autocorr;
 pub mod composition;
+pub mod diff_composition;
+pub mod diff_niches;
 pub mod gmm;
 pub mod interactions;
 pub mod markers;
 pub mod neighbors;
 pub mod nmf;
+pub mod ripley;
+pub mod transitions;

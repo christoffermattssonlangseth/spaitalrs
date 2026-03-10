@@ -11,6 +11,13 @@ pub struct CompositionRecord {
     pub group: String,
 }
 
+#[derive(Serialize)]
+pub struct EntropyRecord {
+    pub cell_i: String,
+    pub entropy: f64,
+    pub group: String,
+}
+
 /// Compute the per-cell neighbourhood composition within `radius`.
 /// For each cell, counts the cell types among its neighbours and returns
 /// one row per (cell, neighbour_type) with the fraction of that type.
@@ -82,9 +89,45 @@ pub fn compute_composition(
     Ok(records)
 }
 
+/// Compute Shannon entropy (bits) of the neighbourhood composition per cell.
+///
+/// Given the output of `compute_composition`, groups rows by `(cell_i, group)` and
+/// computes H = −Σₖ pₖ log₂(pₖ).  High entropy means a heterogeneous neighbourhood;
+/// low entropy means a homogeneous one.  Cells absent from `composition` are omitted.
+pub fn compute_entropy(composition: &[CompositionRecord]) -> Vec<EntropyRecord> {
+    // Aggregate fractions by (cell_i, group)
+    let mut cell_fracs: HashMap<(&str, &str), Vec<f64>> = HashMap::new();
+    for rec in composition {
+        cell_fracs
+            .entry((rec.cell_i.as_str(), rec.group.as_str()))
+            .or_default()
+            .push(rec.fraction);
+    }
+
+    let mut records: Vec<EntropyRecord> = cell_fracs
+        .into_iter()
+        .map(|((cell_i, group), fracs)| {
+            let entropy = fracs
+                .iter()
+                .filter(|&&p| p > 0.0)
+                .map(|&p| -p * p.log2())
+                .sum();
+            EntropyRecord {
+                cell_i: cell_i.to_string(),
+                entropy,
+                group: group.to_string(),
+            }
+        })
+        .collect();
+
+    // Stable sort by cell_i for deterministic output
+    records.sort_by(|a, b| a.cell_i.cmp(&b.cell_i));
+    records
+}
+
 #[cfg(test)]
 mod tests {
-    use super::compute_composition;
+    use super::{compute_composition, compute_entropy, CompositionRecord};
 
     #[test]
     fn composition_rejects_non_positive_radius() {
@@ -99,5 +142,52 @@ mod tests {
         assert!(err
             .to_string()
             .contains("radius must be a finite value > 0"));
+    }
+
+    #[test]
+    fn entropy_uniform_composition_is_max() {
+        // 3 equal fractions → H = log₂(3) ≈ 1.585 bits
+        let comp = vec![
+            CompositionRecord {
+                cell_i: "c1".to_string(),
+                cell_type: "A".to_string(),
+                fraction: 1.0 / 3.0,
+                group: "g".to_string(),
+            },
+            CompositionRecord {
+                cell_i: "c1".to_string(),
+                cell_type: "B".to_string(),
+                fraction: 1.0 / 3.0,
+                group: "g".to_string(),
+            },
+            CompositionRecord {
+                cell_i: "c1".to_string(),
+                cell_type: "C".to_string(),
+                fraction: 1.0 / 3.0,
+                group: "g".to_string(),
+            },
+        ];
+        let records = compute_entropy(&comp);
+        assert_eq!(records.len(), 1);
+        let expected = (3.0f64).log2();
+        assert!(
+            (records[0].entropy - expected).abs() < 1e-10,
+            "expected H={expected}, got {}",
+            records[0].entropy
+        );
+    }
+
+    #[test]
+    fn entropy_pure_composition_is_zero() {
+        // One cell type with fraction 1.0 → H = 0
+        let comp = vec![CompositionRecord {
+            cell_i: "c1".to_string(),
+            cell_type: "A".to_string(),
+            fraction: 1.0,
+            group: "g".to_string(),
+        }];
+        let records = compute_entropy(&comp);
+        assert_eq!(records.len(), 1);
+        assert!(records[0].entropy.abs() < 1e-10, "expected H=0 for pure neighbourhood");
     }
 }

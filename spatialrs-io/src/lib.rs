@@ -4,6 +4,18 @@ use ndarray::Array2;
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Sparse CSR matrix of f32 values.
+pub struct CsrMatrix {
+    /// Non-zero values.
+    pub data: Vec<f32>,
+    /// Column index for each non-zero value.
+    pub indices: Vec<usize>,
+    /// Row-start pointers, length nrows + 1.
+    pub indptr: Vec<usize>,
+    pub nrows: usize,
+    pub ncols: usize,
+}
+
 /// In-memory representation of the data we need from an .h5ad file.
 pub struct AnnData {
     /// Cell barcodes / obs index, length N.
@@ -14,8 +26,10 @@ pub struct AnnData {
     pub coordinates: Array2<f64>,
     /// Obs columns requested by the caller (column name → per-cell string values).
     pub obs: HashMap<String, Vec<String>>,
-    /// X matrix (N × G), loaded only when `load_expression` is true.
+    /// X matrix (N × G) as dense f32, loaded only when `load_expression` is true.
     pub expression: Option<Array2<f32>>,
+    /// X matrix in sparse CSR format, loaded only when `load_sparse` is true.
+    pub sparse_expression: Option<CsrMatrix>,
     /// obsm embeddings keyed by obsm key name.
     pub embeddings: HashMap<String, Array2<f64>>,
 }
@@ -23,11 +37,20 @@ pub struct AnnData {
 /// Read an .h5ad file and return an `AnnData` containing the obs index,
 /// spatial coordinates, requested obs columns, optional expression matrix,
 /// and requested obsm embeddings.
+///
+/// `load_expression` – densify the X matrix into `AnnData.expression`.
+/// `load_sparse`     – keep X in CSR format in `AnnData.sparse_expression`
+///                     (much lower memory for typical sparse scRNA-seq data).
+/// `layer`           – read from `layers/<name>` instead of `X` when provided.
+/// Both load flags may be false; at most one should be true for NMF.
 pub fn read_h5ad(
     path: &Path,
     obs_cols: &[&str],
     obsm_keys: &[&str],
     load_expression: bool,
+    load_sparse: bool,
+    var_filter: Option<&str>,
+    layer: Option<&str>,
 ) -> Result<AnnData> {
     let file = hdf5::File::open(path).with_context(|| format!("cannot open {:?}", path))?;
 
@@ -54,19 +77,73 @@ pub fn read_h5ad(
         obs.insert(col.to_string(), values);
     }
 
-    let var_names = if load_expression || !obsm_keys.is_empty() {
-        read_var_names(&file).unwrap_or_default()
-    } else {
-        Vec::new()
+    // Resolve var names and gene mask once (used by both dense and sparse paths)
+    let (var_names_all, gene_mask): (Vec<String>, Option<Vec<bool>>) =
+        if load_expression || load_sparse {
+            let all_var_names = read_var_names(&file).unwrap_or_default();
+            let mask = if let Some(col) = var_filter {
+                let m = read_var_bool_column(&file, col)
+                    .with_context(|| format!("reading var column '{col}'"))?;
+                if m.len() != all_var_names.len() {
+                    bail!(
+                        "var column '{col}' length ({}) != var_names length ({})",
+                        m.len(),
+                        all_var_names.len()
+                    );
+                }
+                let n_kept = m.iter().filter(|&&v| v).count();
+                eprintln!(
+                    "var_filter '{col}': keeping {n_kept}/{} genes",
+                    all_var_names.len()
+                );
+                Some(m)
+            } else {
+                None
+            };
+            (all_var_names, mask)
+        } else {
+            let var_names = if !obsm_keys.is_empty() {
+                read_var_names(&file).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            (var_names, None)
+        };
+
+    let filtered_var_names: Vec<String> = match &gene_mask {
+        Some(mask) => var_names_all
+            .iter()
+            .zip(mask.iter())
+            .filter_map(|(n, &keep)| if keep { Some(n.clone()) } else { None })
+            .collect(),
+        None => var_names_all,
     };
 
     let expression = if load_expression {
-        let expression = read_expression_matrix(&file).context("reading expression matrix X")?;
-        ensure_row_count("expression matrix X", expression.nrows(), obs_names.len())?;
-        Some(expression)
+        let expr = read_expression_matrix(&file, gene_mask.as_deref(), layer)
+            .context("reading expression matrix X")?;
+        ensure_row_count("expression matrix X", expr.nrows(), obs_names.len())?;
+        Some(expr)
     } else {
         None
     };
+
+    let sparse_expression = if load_sparse {
+        let csr = read_expression_sparse(&file, gene_mask.as_deref(), layer)
+            .context("reading sparse expression matrix X")?;
+        if csr.nrows != obs_names.len() {
+            bail!(
+                "sparse expression matrix row count ({}) does not match obs count ({})",
+                csr.nrows,
+                obs_names.len()
+            );
+        }
+        Some(csr)
+    } else {
+        None
+    };
+
+    let var_names = filtered_var_names;
 
     let mut embeddings = HashMap::new();
     for key in obsm_keys {
@@ -81,6 +158,7 @@ pub fn read_h5ad(
         coordinates,
         obs,
         expression,
+        sparse_expression,
         embeddings,
     })
 }
@@ -196,11 +274,19 @@ fn read_obsm_embedding(file: &hdf5::File, key: &str) -> Result<Array2<f64>> {
     bail!("obsm/{key} is not f32 or f64")
 }
 
-/// Read the expression matrix X (N × G) as f32.
-/// Handles both sparse CSR groups and dense datasets.
-fn read_expression_matrix(file: &hdf5::File) -> Result<Array2<f32>> {
+/// Read the expression matrix (N × G) as f32.
+/// `layer` selects `layers/<name>` instead of `X` when provided.
+/// If `gene_mask` is provided, only columns where mask[col] is true are included.
+fn read_expression_matrix(
+    file: &hdf5::File,
+    gene_mask: Option<&[bool]>,
+    layer: Option<&str>,
+) -> Result<Array2<f32>> {
+    let layer_path = layer.map(|l| format!("layers/{l}"));
+    let group_key = layer_path.as_deref().unwrap_or("X");
+
     // Try sparse CSR group first
-    if let Ok(grp) = file.group("X") {
+    if let Ok(grp) = file.group(group_key) {
         if let (Ok(data_ds), Ok(indices_ds), Ok(indptr_ds)) = (
             grp.dataset("data"),
             grp.dataset("indices"),
@@ -217,32 +303,169 @@ fn read_expression_matrix(file: &hdf5::File) -> Result<Array2<f32>> {
             let indices = read_usize_vec(&indices_ds).context("reading X/indices")?;
             let indptr = read_usize_vec(&indptr_ds).context("reading X/indptr")?;
 
-            // Read shape from attribute
             let (n_obs, n_var) = read_csr_shape(&grp)?;
             validate_csr_layout(n_obs, n_var, data.len(), &indices, &indptr)?;
 
-            let mut dense = Array2::<f32>::zeros((n_obs, n_var));
+            // Build column remapping: old_col → new_col (None = skip)
+            let (n_out, col_remap): (usize, Vec<Option<usize>>) = match gene_mask {
+                None => (n_var, (0..n_var).map(Some).collect()),
+                Some(mask) => {
+                    let mut remap = vec![None; n_var];
+                    let mut new_col = 0usize;
+                    for (i, &keep) in mask.iter().enumerate() {
+                        if keep {
+                            remap[i] = Some(new_col);
+                            new_col += 1;
+                        }
+                    }
+                    (new_col, remap)
+                }
+            };
+
+            let mut dense = Array2::<f32>::zeros((n_obs, n_out));
             for row in 0..n_obs {
                 let start = indptr[row];
                 let end = indptr[row + 1];
                 for k in start..end {
                     let col = indices[k];
-                    dense[[row, col]] = data[k];
+                    if let Some(new_col) = col_remap[col] {
+                        dense[[row, new_col]] = data[k];
+                    }
                 }
             }
             return Ok(dense);
         }
     }
 
-    // Fallback: dense dataset at X
-    let ds = file.dataset("X").context("no 'X' dataset or group")?;
-    if let Ok(arr) = ds.read_2d::<f32>() {
-        return Ok(arr);
+    // Fallback: dense dataset
+    let ds = file
+        .dataset(group_key)
+        .with_context(|| format!("no '{}' dataset or group", group_key))?;
+    let arr = if let Ok(a) = ds.read_2d::<f32>() {
+        a
+    } else if let Ok(a) = ds.read_2d::<f64>() {
+        a.mapv(|v| v as f32)
+    } else {
+        bail!("{} dataset is not f32 or f64", group_key);
+    };
+
+    // Apply column filter to dense matrix
+    match gene_mask {
+        None => Ok(arr),
+        Some(mask) => {
+            let kept_cols: Vec<usize> = mask
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &k)| if k { Some(i) } else { None })
+                .collect();
+            Ok(arr.select(ndarray::Axis(1), &kept_cols))
+        }
     }
-    if let Ok(arr) = ds.read_2d::<f64>() {
-        return Ok(arr.mapv(|v| v as f32));
+}
+
+/// Read the expression matrix as a sparse CSR matrix of f32.
+/// `layer` selects `layers/<name>` instead of `X` when provided.
+/// If `gene_mask` is provided, only columns where mask[col] is true are included
+/// and the column indices are remapped to the filtered space.
+/// Requires the target to be stored as a CSR sparse group (data/indices/indptr).
+fn read_expression_sparse(
+    file: &hdf5::File,
+    gene_mask: Option<&[bool]>,
+    layer: Option<&str>,
+) -> Result<CsrMatrix> {
+    let group_key = match layer {
+        Some(l) => format!("layers/{l}"),
+        None => "X".to_string(),
+    };
+    let label = layer.unwrap_or("X");
+    let grp = file.group(&group_key).with_context(|| {
+        format!("sparse mode requires '{label}' stored as a CSR group (data/indices/indptr)")
+    })?;
+
+    let (data_ds, indices_ds, indptr_ds) = (
+        grp.dataset("data").context("X/data not found")?,
+        grp.dataset("indices").context("X/indices not found")?,
+        grp.dataset("indptr").context("X/indptr not found")?,
+    );
+
+    let data: Vec<f32> = if let Ok(d) = data_ds.read_1d::<f32>() {
+        d.to_vec()
+    } else if let Ok(d) = data_ds.read_1d::<f64>() {
+        d.iter().map(|&v| v as f32).collect()
+    } else {
+        bail!("X/data is not f32 or f64");
+    };
+
+    let indices = read_usize_vec(&indices_ds).context("reading X/indices")?;
+    let indptr = read_usize_vec(&indptr_ds).context("reading X/indptr")?;
+    let (n_obs, n_var) = read_csr_shape(&grp)?;
+    validate_csr_layout(n_obs, n_var, data.len(), &indices, &indptr)?;
+
+    // Apply gene mask: filter columns and remap indices.
+    match gene_mask {
+        None => Ok(CsrMatrix {
+            data,
+            indices,
+            indptr,
+            nrows: n_obs,
+            ncols: n_var,
+        }),
+        Some(mask) => {
+            let mut col_remap = vec![None::<usize>; n_var];
+            let mut new_col = 0usize;
+            for (i, &keep) in mask.iter().enumerate() {
+                if keep {
+                    col_remap[i] = Some(new_col);
+                    new_col += 1;
+                }
+            }
+            let n_out = new_col;
+
+            let mut new_data: Vec<f32> = Vec::new();
+            let mut new_indices: Vec<usize> = Vec::new();
+            let mut new_indptr: Vec<usize> = vec![0; n_obs + 1];
+
+            for row in 0..n_obs {
+                let start = indptr[row];
+                let end = indptr[row + 1];
+                for k in start..end {
+                    if let Some(nc) = col_remap[indices[k]] {
+                        new_data.push(data[k]);
+                        new_indices.push(nc);
+                    }
+                }
+                new_indptr[row + 1] = new_data.len();
+            }
+
+            Ok(CsrMatrix {
+                data: new_data,
+                indices: new_indices,
+                indptr: new_indptr,
+                nrows: n_obs,
+                ncols: n_out,
+            })
+        }
     }
-    bail!("X dataset is not f32 or f64")
+}
+
+/// Read a boolean var column (e.g. "highly_variable") as a Vec<bool>.
+/// Handles uint8 (0/1), int8, and native bool HDF5 types.
+fn read_var_bool_column(file: &hdf5::File, col: &str) -> Result<Vec<bool>> {
+    let var = file.group("var").context("no 'var' group")?;
+    let ds = var
+        .dataset(col)
+        .with_context(|| format!("var/{col} not found"))?;
+
+    if let Ok(arr) = ds.read_1d::<u8>() {
+        return Ok(arr.iter().map(|&v| v != 0).collect());
+    }
+    if let Ok(arr) = ds.read_1d::<i8>() {
+        return Ok(arr.iter().map(|&v| v != 0).collect());
+    }
+    if let Ok(arr) = ds.read_1d::<bool>() {
+        return Ok(arr.to_vec());
+    }
+    bail!("var/{col} could not be read as a boolean column (tried u8, i8, bool)")
 }
 
 fn read_usize_vec(ds: &hdf5::Dataset) -> Result<Vec<usize>> {
@@ -503,7 +726,7 @@ mod tests {
             write_string_dataset(&obs, "sample", &["s1"]);
             drop(file);
 
-            let err = match read_h5ad(path, &["sample"], &[], false) {
+            let err = match read_h5ad(path, &["sample"], &[], false, false, None, None) {
                 Ok(_) => panic!("expected obs row count mismatch"),
                 Err(err) => err,
             };
@@ -524,7 +747,7 @@ mod tests {
                 .unwrap();
             drop(file);
 
-            let err = match read_h5ad(path, &[], &["X_pca"], false) {
+            let err = match read_h5ad(path, &[], &["X_pca"], false, false, None, None) {
                 Ok(_) => panic!("expected embedding row count mismatch"),
                 Err(err) => err,
             };
@@ -544,7 +767,7 @@ mod tests {
                 .unwrap();
             drop(file);
 
-            let err = match read_h5ad(path, &[], &[], true) {
+            let err = match read_h5ad(path, &[], &[], true, false, None, None) {
                 Ok(_) => panic!("expected expression row count mismatch"),
                 Err(err) => err,
             };
@@ -568,7 +791,7 @@ mod tests {
             write_string_dataset(&sample, "categories", &["tumor"]);
             drop(file);
 
-            let adata = read_h5ad(path, &["sample"], &[], false).unwrap();
+            let adata = read_h5ad(path, &["sample"], &[], false, false, None, None).unwrap();
             assert_eq!(
                 adata.obs["sample"],
                 vec!["tumor".to_string(), String::new()]
