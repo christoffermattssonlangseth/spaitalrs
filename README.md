@@ -27,6 +27,19 @@ Requires a system HDF5 library (the `hdf5-metno` crate links against it).
 
 ---
 
+## Repo utilities
+
+Reusable local runner scripts live in [`scripts/`](/Users/christoffer/work/karolinska/development/spatialrs/scripts):
+
+- `scripts/end-to-end-pipeline.sh` — runs the full currently available CLI surface
+- `scripts/runspatialrs-balo.sh`
+- `scripts/runspatialrs-hm-sc.sh`
+- `scripts/runspatialrs-rrmap.sh`
+
+Generated analysis outputs such as project-local `.h5ad` exports are ignored and should stay out of git history.
+
+---
+
 ## Subcommands
 
 ### `radius` — radius-based neighbour graph
