@@ -8,6 +8,14 @@ Guidelines for AI agents working in this repository.
 
 ```
 spatialrs/
+├── scripts/                      Local runner scripts for full pipelines / datasets
+│   ├── end-to-end-pipeline.sh
+│   ├── runspatialrs-balo.sh
+│   ├── runspatialrs-hm-sc.sh
+│   └── runspatialrs-rrmap.sh
+├── notebooks/                    Analysis notebooks that join CSV outputs back to AnnData
+│   ├── explore_niches-*.ipynb
+│   └── map_spatialrs_outputs_to_h5ad.ipynb
 ├── spatialrs-io/src/lib.rs       HDF5 reader (AnnData struct + read_h5ad)
 ├── spatialrs-core/src/
 │   ├── lib.rs                    Module declarations
@@ -26,6 +34,8 @@ spatialrs/
 Note: `compute_graph_stats` lives in `neighbors.rs` (no separate module needed).
 └── spatialrs-cli/src/main.rs     Clap CLI; one match arm per subcommand
 ```
+
+Generated outputs such as project-local `.h5ad` exports, CSVs, and the Rust `target/` directory are not part of the source tree even if they exist locally.
 
 ---
 
@@ -111,6 +121,10 @@ spatialrs composition data.h5ad --cell-type cell_type --radius 50 --groupby samp
 spatialrs diff-composition data.h5ad --composition-csv comp.csv \
     --condition condition --group-a tumor --group-b normal --output diff.csv
 ```
+
+Local helper scripts for these workflows now live under `scripts/`. If you adjust CLI flags or expected outputs, update the corresponding script(s) as part of the same change.
+
+The notebook [`notebooks/map_spatialrs_outputs_to_h5ad.ipynb`](/Users/christoffer/work/karolinska/development/spatialrs/notebooks/map_spatialrs_outputs_to_h5ad.ipynb) is the current reference for mapping `spatialrs` outputs back into `AnnData` (`obs`, `obsm`, `varm`, `obsp`, `uns`) and for downstream niche/marker analysis.
 
 ---
 
@@ -205,11 +219,13 @@ Both helper functions are in `spatialrs-cli/src/main.rs` and validate against ob
 - Do not use `unwrap()` or `expect()` in library code (`spatialrs-core`, `spatialrs-io`). Propagate errors with `?` and `anyhow::Context`.
 - All CSV record structs must derive `serde::Serialize` and include a `group: String` field, except pooled `MarkerRecord`.
 - The `read_h5ad` signature is fixed: `(path, obs_cols, obsm_keys, load_expression, load_sparse, var_filter, layer)`. Do not change it without updating all call sites.
+- Do not commit generated artifacts such as `target/`, `.DS_Store`, project-local `.h5ad` files, or ad hoc output CSVs produced by running the CLI.
 
 ---
 
 ## Common pitfalls
 
+- **Generated files vs source files**: repo-cleanup has already removed tracked `target/` output and Finder metadata. Keep it that way. If a change only affects generated files, do not stage them.
 - **`ndarray::Axis`** is not re-exported by spatialrs-core. If you need it in the CLI, add `ndarray` as a direct dependency of `spatialrs-cli`.
 - **Sparse X matrices** in h5ad may use `i32`, `i64`, `u32`, or `u64` for `indptr`/`indices`. Use `read_usize_vec` in `spatialrs-io` to handle all variants.
 - **obs column encoding**: h5ad writes categorical columns as `codes + categories` groups, not flat arrays. `read_obs_column` handles both; do not bypass it.
@@ -222,3 +238,4 @@ Both helper functions are in `spatialrs-cli/src/main.rs` and validate against ob
 - **SVG vs morans**: `svg` loads the expression matrix (`load_expression: true`); `morans` loads an obsm embedding or NMF W CSV. Both call `compute_morans_i` internally.
 - **Geary's C sign**: z_score < 0 means positive spatial autocorrelation (C < 1), opposite sign convention to Moran's I where z_score > 0 means positive. Keep this in mind when interpreting combined results.
 - **`diff-niches` vs `diff-composition`**: `diff-niches` operates at the **sample level** (one observation = one sample's niche fraction); `diff-composition` operates at the **cell level** (one observation = one cell's neighbourhood fraction). Use `diff-niches` for multi-sample comparisons; use `diff-composition` for single-sample conditions.
+- **Notebook execution state**: when editing `.ipynb` files, avoid leaving misleading cached outputs that no longer match the source cells. Prefer clean JSON with source-of-truth in the cell bodies.

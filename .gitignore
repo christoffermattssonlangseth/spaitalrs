@@ -1,4 +1,7 @@
 /target/
-*.csv
 .DS_Store
+/__pycache__/
+*.pyc
+.ipynb_checkpoints/
+/projects/**/*.csv
 /projects/**/*.h5ad
